@@ -16,6 +16,12 @@ readme = "README.md"
 #documentation = "https://mayhl.github.io/FUNWAVE-TVD-Python-Tools/"
 #repository = "https://github.com/mayhl/FUNWAVE-TVD-Python-Tools"
 
+[tool.poetry.dependencies]
+python = ">=3.8,<4"
+numpy = "<=1.24.4"
+anytree = "^2.12.1"
+termcolor = "^2.4.0"
+pandas = "^2.0.3"
 
 [tool.poetry2conda]
 name = "directorybatching"

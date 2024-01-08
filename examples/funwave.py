@@ -1,8 +1,8 @@
 
-from src.funwavebatch import FunwaveBatch
-from src.table import Map as TableMap
-from src.directory import Map as DirectoryMap
-from src.param import Map as ParamMap
+from directorybatching.model import FunwaveBatch
+from directorybatching.core.table import Map as TableMap
+from directorybatching.core.directory import Map as DirectoryMap
+from directorybatching.core.param import Map as ParamMap
 import argparse
 import logging
 

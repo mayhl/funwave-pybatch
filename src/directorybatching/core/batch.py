@@ -1,10 +1,10 @@
 
-import src.directory as directory
-import src.table as table
-import src.param as param
-import src.misc as misc 
+import directorybatching.core.directory as directory
+import directorybatching.core.table as table
+import directorybatching.core.param as param
+import directorybatching.core.misc as misc 
+from directorybatching.core.logger import MultiLogger, BufferedLogger
 
-from src.logger import MultiLogger, BufferedLogger
 import argparse
 import os
 from abc import ABC, abstractmethod

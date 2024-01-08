@@ -1,5 +1,6 @@
 
-import src.status as status
+import directorybatching.core.status as status
+
 from collections import namedtuple
 import pandas as pd
 import os

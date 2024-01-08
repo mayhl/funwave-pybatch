@@ -1,4 +1,4 @@
-import src.status as status
+import directorybatching.core.status as status
 
 import os
 from anytree import Node, RenderTree, AsciiStyle, PostOrderIter

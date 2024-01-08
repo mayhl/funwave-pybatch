@@ -1,7 +1,6 @@
 
-from src.batch import Batch
-from src.param import Param
-
+from directorybatching.core.batch import Batch
+from directorybatching.core.param import Param
 
 class FunwaveParam(Param):
     pass
