@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "directorybatching"
+version = "0.1.0"
+description = "Framework for batching embarrassingly parallelizable processing based on directory structure."
+authors = [
+   "Michael-Angelo Y.-H. Lam <michaelangelo.yh.lam@gmail.com>"
+]
+maintainers = [
+   "Michael-Angelo Y.-H. Lam <michaelangelo.yh.lam@gmail.com>"
+]
+keywords = ["funwave-tvd", "parallel"]
+license = "BSD-2-Clause"
+readme = "README.md"
+
+#[project.urls]
+#documentation = "https://mayhl.github.io/FUNWAVE-TVD-Python-Tools/"
+#repository = "https://github.com/mayhl/FUNWAVE-TVD-Python-Tools"
+
+
+[tool.poetry2conda]
+name = "directorybatching"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
