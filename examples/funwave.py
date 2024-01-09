@@ -1,4 +1,3 @@
-
 from directorybatching.model import FunwaveBatch
 from directorybatching.core.table import Map as TableMap
 from directorybatching.core.directory import Map as DirectoryMap
@@ -6,47 +5,62 @@ from directorybatching.core.param import Map as ParamMap
 import argparse
 import logging
 
-
 # Parsing functions for directory names
 
-# Strips away name from the start of a string, parsing the value
-# func and return in dict, e.g.,
-#   "name_431" => parser("_431") => {'value': 431}
-def strip_name(name, string, parser):
-    # Checking directory is valid
+# Strips away name from the start of a string, parsing the value, 
+# and return a dict, e.g.,
+#   "name431" => parser("431") => {'value': 431}
+def startswith(name, string, parser):
     if not string.startswith(name): return None
     val_str = string[len(name):]
     return {'value': parser(val_str)}
 
+# Last argument is a function, e.g., int(x)
+def fmt_int(name, string): return startswith(name, string, int)
 
-def fmt_int(name, string): return strip_name(name, string, int)
+# NOTE: Lambda function, quick way define simple functions, e.g., y=f(x)
+# Formatting a 3 digit string with decimal after first, e.g.,
+#  '010' => 0.1, '212' => 2.12
+def fmt_3d(name, string) : return startswith(name, string, lambda x:  int(x)/100)
+# Same as before but numbers are negative, e.g.,
+#  '527' => -5.27
+def fmt_n3d(name, string): return startswith(name, string, lambda x: -int(x)/100)
 
-def fmt_3d(name, string): return strip_name(name, string, lambda n: int(n)/100)
-def fmt_n3d(name, string): return strip_name(name, string, lambda n: -int(n)/100)
-
-# Strips away last part of string seperated by a delimiter and passes
-# begining to parsers to get name and value, e.g.,
-#   "name_431_XY" => ("name_431", "XY") => {'value': 431, suffix: 'XY"}
-def split_pop_last(name, string, nparser, vparser, delimiter='_'):
+# Using virtual keywords you can setup a virtual subdirectory splitting 
+# at final directory depth, e.g., seperating simulations by job ID 
+#
+# Cuts away last part of string seperated by delimiter, passes
+# result, to parsers, and adds virtual keyword/value pairs, e.g., 
+#   "name_431_XY" => ("name_431", "XY") => 
+#     {'value'        : 431         , 
+#      'virtual_name' : virtual_name,
+#      'virtual_value': 'XY'        }
+def cut_last(name, string, virtual_name, nparser, vparser, delimiter='_'):
 
     comps = string.split(delimiter)
 
     if len(comps) < 2: return None, None
 
-    *comps, suffix = comps
+    *comps, virtual_value = comps
     string = delimiter.join(comps)
 
     rtn_dict = nparser(name, string, vparser)
 
     if rtn_dict is None: return None
-    rtn_dict['suffix']=suffix
 
-    return rtn_dict
+    virtual_dict={'virtual_name' : virtual_name, 
+                  'virtual_value': virtual_value}
 
-def fmt_4d(name, string): 
-    return split_pop_last(name, string, strip_name, lambda n: int(n)/1000)   
+    return {**rtn_dict, **virtual_dict}
+
+# Wrapper function for above specifying the name of the virtual subdirectory 
+def cut_jobid(name, string, nparser, vparser):
+    return cut_last(name, string, 'jobid', nparser, vparser)
+
+# Similar to before but with 4 digit number and spliting off jobid
+def fmt_cd(name, string): 
+    return cut_jobid(name, string, startswith, lambda n: int(n)/1000)   
     
-
 
 class MyFunwaveBatch(FunwaveBatch):
 
@@ -63,7 +77,7 @@ class MyFunwaveBatch(FunwaveBatch):
                 DirectoryMap('relF'  , 'relF'  , fmt_n3d, float),
                 DirectoryMap('relB'  , 'relB'  , fmt_3d , float),
                 DirectoryMap('m'     , 'm'     , fmt_int, int  ),
-                DirectoryMap('cd'    , 'cd'    , fmt_4d , float)]
+                DirectoryMap('cd'    , 'cd'    , fmt_cd , float)]
 
         return maps
 

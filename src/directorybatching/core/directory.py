@@ -1,5 +1,5 @@
 import directorybatching.core.status as status
-
+import copy
 import os
 from anytree import Node, RenderTree, AsciiStyle, PostOrderIter
 from abc import ABC, abstractmethod
@@ -92,32 +92,20 @@ class Structure:
 
         return df, map
 
-    def __leaf_to_dict(self, l, id):
+    def __leaf_to_dict(self, l, map_id):
 
-        ld = l.__dict__.copy()
-
-        # Hacky solution to key dynamic attributes for parsers
-        HACK_IGNORE=['_NodeMixin__children', '_NodeMixin__parent']
-        for k in HACK_IGNORE: del ld[k]
-
-        # Hacky solution until I fixed suffix parser conventions
-        if ld['bname'] is None: ld['job_id'] = ld['name']
-        ld['dir_id'] = id
-        IGNORE=['is_vleaf', 'suffixes', 'bname', 'value', 'name']  
-        for k in IGNORE: del ld[k]
-
-        while not l.parent.is_root:
+        total = {'dir_id': map_id} 
+        while not l.is_root:
+            total.update({k: v for k, v in l.rtnval.items() if not k =='value'})
+            total[l.bname] = l.rtnval['value'] 
             l = l.parent
-            t = l.__dict__
-            ld[t['bname']] = t['value']
 
-        return ld
+        return total
 
     def _update_status(self, p=None):
         if p is None: 
             p = self._root
             self._n_updates += 1
-
 
         if not p.is_leaf:
             statuses =  np.array([self._update_status(c) for c in p.children])
@@ -131,7 +119,7 @@ class Structure:
 
         elif p.is_vleaf:
             statuses =  np.array([self._update_status(c) for c in p.children])
-            p._status = Statuses.min(statuses)
+            p._status = Status.min(statuses)
 
         return p.status 
 
@@ -194,44 +182,57 @@ class Structure:
 
     def __process_subdir(self, sub_dname, dpath, map, is_last):
 
+        def qreturn(is_valid, rtnvalue={}, is_vleaf=False):
+
+            status = Status.VALID if is_valid else Status.INVALID
+            attrs = {'dpath'   : sub_dpath   ,
+                     "status"  : status      ,
+                     "bname"   : map.dir_name,
+                     "is_vleaf": is_vleaf    ,
+                     'rtnval'  : rtnval       }
+
+            return is_vleaf, (sub_dname, attrs)
+
         logger = self._logger
-
-        def qreturn(is_valid, new_attrs={}):
-
-            attrs = {'dpath'   : sub_dpath                                   , 
-                     "status"  : Status.VALID if is_valid else Status.INVALID,
-                     "bname"   : map.dir_name                                ,
-                     "is_vleaf": False                                       }
-
-            return sub_dname, {**attrs, **new_attrs}
-
         sub_dpath = os.path.join(dpath, sub_dname)
 
         try:
             rtnval = map.parser(map.dir_name, sub_dname)
         except Exception as e:
-            logger.error("Subfolder '%s' caused an error in the parser for directory map '%s' at path '%s'." % (sub_dname, map.dir_name, dpath))
+            logger.config("Subfolder '%s' caused an error in the parser for directory map '%s' "\
+                          "at path '%s'." % (sub_dname, map.dir_name, dpath)                     )
 
         if rtnval is None: 
-            logger.warning("Subfolder '%s' did not parse for directory map '%s' at path '%s'." % (sub_dname, map.dir_name, dpath))
-            return qreturn(false)
+            logger.warning("Subfolder '%s' did not parse for directory map '%s' at "\
+                           "path '%s'." % (sub_dname, map.dir_name, dpath)           )
+            return qreturn(False)
        
         if not type(rtnval) is dict:
-            logger.error("Parser for directory map, '%s', did not return a dict: got type '%s'." % (map.dir_name, type(rtn_val)))
+            logger.config("Parser for directory map, '%s', did not return a dict: got "\
+                          "type '%s'." % (map.dir_name, type(rtn_val)))
+    
+        # FUTURE IDEA: Remove value keyword restriction
+        if not 'value' in rtnval:
+            logger.config("Parser for directory map, '%s', did not return dict with: "\
+                          "keyword 'value'." % (map.dir_name)                          )
 
-        has_suffix = 'suffix' in rtnval
-        if is_last and not has_suffix:
-            logger.error("Parser for last directory map, '%s', did not return a dictionary with key 'suffix'." % (map.dir_name))
+        is_vname = 'virtual_name' in rtnval
+        is_vval  = 'virtual_value' in rtnval
+        is_vleaf = is_vname and is_vval
+
+        if not is_vname == is_vval:
+            logger.config("Parser for directory map, '%s', return a dict with incomplete "\
+                          "virtual directory keywords." % (map.dir_name))
+
+        if is_last and not is_vleaf:
+            logger.config("Parser for last directory map, '%s', did not return a virtual "\
+                          "directory keywords." % (map.dir_name))
         
-        if not is_last and has_suffix: 
-            logger.error("Parser for directory map, '%s', returned a dictionary with key 'suffix' when it should not." % (map.dir_name))
+        if not is_last and is_vleaf: 
+            logger.config("Parser for directory map, '%s', returned a dictionary with virtual "\
+                          "directory keywords when it should not have." % (map.dir_name))
 
-        if has_suffix:
-            rtnval['suffixes'] = [rtnval['suffix']]
-            del rtnval['suffix']
-
-        self._has_suffix = has_suffix
-        return qreturn(True, rtnval)
+        return qreturn(True, rtnval, is_vleaf)
 
     def __build_tree(self, dpath, maps, parent=None):
 
@@ -243,34 +244,49 @@ class Structure:
         is_root = parent is None
         if is_root: parent = self._root
 
+        # Parsing subdirectory names 
         is_last = nmaps == 1
-
         out_dname = os.path.basename(self._dpaths.out)
         subinfo = [self.__process_subdir(f.name, dpath, maps[0], is_last) for f in os.scandir(dpath) if f.is_dir() and not f.name == out_dname]
-        #subinfo = [(name, attrs) for is_valid, name, attrs in subinfo if is_valid]
+        is_vleaf_list, subinfo = zip(*subinfo)
 
-        has_suffix = 'suffixes' in subinfo[-1][1]
+        # Safety check 
+        if np.all(is_vleaf_list):
+            has_vleafs = True
+        elif np.all(np.invert(is_vleaf_list)):
+            has_vleafs = False
+        else:
+            self._logger.critical("Only some of node's children reported having a suffix.")
+        
+        if not has_vleafs:
 
-        if not has_suffix:
+            # Recursive calls to build child nodes 
             children = [Node(name, parent, **attrs) for name, attrs in subinfo]
             for child in children: self.__build_tree(os.path.join(dpath,child.name), maps[1:], child)
 
         else:
-            # Creating virtual subtree for max depth subfolder with suffix
+            # Special case for final descendant which has a suffix
+
+            # Collecting children for each parent and cleaning up attributes
             subnodes = {}
             for name, attrs in subinfo:
+                # Special case for first parent
                 if not name in subnodes: 
-                    pattrs = attrs.copy()
-                    pattrs['is_vleaf'] = True 
+                    pattrs = copy.deepcopy(attrs)
                     pattrs['dpath'] = None
+                    del pattrs['rtnval']['virtual_name']
+                    del pattrs['rtnval']['virtual_value']
+
                     subnodes[name] = {'attrs': pattrs, 'children': []}
                 
+                attrs['is_vleaf'] = False
+                attrs['bname'] = attrs['rtnval']['virtual_name']
+                attrs['value'] = attrs['rtnval']['virtual_value']
+                vname = attrs['rtnval']['virtual_name']
+                del attrs['rtnval']['virtual_name']
+                del attrs['rtnval']['virtual_value']
 
-                subnodes[name]['attrs']['suffixes'].extend(attrs['suffixes'])
-                suffix = attrs['suffixes'][0]
-                attrs['suffixes'] = None
-                attrs['bname'] = None
-                subnodes[name]['children'].append((suffix, attrs))
+                subnodes[name]['children'].append((vname, attrs))
 
             # Creating children and grandchildren
             for cname in subnodes:
@@ -287,8 +303,11 @@ class Structure:
         # Checking depth of tree match directory map depth
         max_depth_tree = max([l.depth for l in self.leafs])
 
+        # Hacky check 
+        self._has_vleafs = len(self.vleafs) > 0
+
         # Ignoring last tree depth for virtual leafs 
-        if self._has_suffix: max_depth_tree -= 1
+        if self._has_vleafs: max_depth_tree -= 1
         max_depth_map = len(maps)
         if max_depth_tree > max_depth_map:
             logger.critical("Max tree depth greater than number of directory maps: specified %d, found %d!!!" % (max_depth_map, max_depth_tree))
@@ -297,10 +316,10 @@ class Structure:
             logger.error("No directories exist at specfied directory map depth: specified %d, found %d!" % (max_depth_map, max_depth_tree))
 
         max_depth = max_depth_map
-        if self._has_suffix: max_depth += 1
+        if self._has_vleafs: max_depth += 1
         for l in self.leafs: l.status = Status.VALID if l.depth == max_depth else Status.INVALID
 
-        self.filter_valid('dir_depth')
+        self.filter_valid('depth_check')
 
     def __flatten_vleafs(self):
 
@@ -308,6 +327,11 @@ class Structure:
         for vl in self.vleafs:
             
             min_status = min([c.status for c in vl.children])
+
+            ### NOT ALWAYS THE CASE ##################
+            # Assume last sorted child value is best #
+            ##########################################
+
             best_cname =sorted([c.name for c in vl.children if c.status == min_status])[-1]  
 
             # Sync attributes 
@@ -315,10 +339,11 @@ class Structure:
 
                 if not c.name == best_cname: continue
 
+                # Hacky but independent of parser 
                 vl.name = os.path.basename(c.dpath)
                 vl.dpath = c.dpath
                 vl.is_vleaf = False
-                vl.suffixes = None
+                # vl.suffixes = None
                 del vl.children
 
                 break

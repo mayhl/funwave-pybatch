@@ -164,16 +164,12 @@ class Table:
         # Remove merge indicator column
         del_cols = ['_merge']
         # Removing duplicated columns from merge  
-        print(del_cols); print('------------------------')
         del_cols.extend([c for c in df.columns if c.endswith(drop_suffix)])
         # Removing temporary 'integerized' float columns 
-        print(del_cols); print('------------------------')
         del_cols.extend(tmp_cols)
         # Optional extra columns to remove 
-        print(del_cols); print('------------------------')
         del_cols.extend(extra_drops)
 
-        print(del_cols); print('=======================')
         df = df.drop(columns=del_cols)
 
         # Removing suffix from duplicate columns from merge 
