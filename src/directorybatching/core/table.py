@@ -4,7 +4,7 @@ import directorybatching.core.status as status
 from collections import namedtuple
 import pandas as pd
 import os
-
+import numpy as np
 
 class Status(status.Base):
 
@@ -16,25 +16,74 @@ class Status(status.Base):
 
 Map = namedtuple("TableMap", "name col_name")
 
-UPDATE_COLUMN='batch_update_count'
-VALID_COLUMN="batch_is_row_still_valid"
-
+STATUS_ID_COLUMN = 'batch_status_id'
+VALID_COLUMN  = "batch_is_row_still_valid"
+STATUS_COLUMN = "status"
+LEAF_ID_COLUMN = "batch_dir_leaf_id"
 class Table:
 
     def __init__(self, batch):
         
-        self._df, self._df_idmap = batch._dstruc.to_dataframe()
-
-        self._n_updates = 0
-        #self._df[UPDATE_COLUMN] = self._n_updates 
-        self._df_all = self._df.copy()
         self._logs_dpath = batch.dpaths.logs
+        self._dtypes = dtypes = {m.name: m.parser.dtype for m in batch._dmaps}
+        self._smaps = batch._status_maps
+        self._dmaps = batch._dmaps
+        self._logger = batch.logger
+        # Tree representation of directory structure 
+        #self._dstruct = batch._dstruc
+        # df       - Dataframe of directory parameters read 
+        # df_idmap - Dictionary mapping some ID in dataframe to
+        #            leafs nodes in order to propagate updates
+        self._df, self._df_idmap = batch._dstruc.to_dataframe()
+    
+        # Dummy internal columns   
+        df = self._df
+        df[STATUS_ID_COLUMN] = df[STATUS_COLUMN].apply(self._smaps.get_id) 
+        df[VALID_COLUMN] = True
 
-    def filter(self, filter):
+        # Configuring dataframe column arrangement and row sorting 
+        cols = ([m.name for m in batch._dmaps])
+        self._sort_columns = cols.copy() ; self._sort_columns.append(STATUS_ID_COLUMN)
+        self._start_columns = cols.copy(); self._start_columns.append(STATUS_COLUMN)
+        self._df = self.__sort_df(self._df)
+        
 
-        raise NotImplementedError()
+    def propagate_statuses(self):
+
+        def update(row):
+
+            is_valid = row[VALID_COLUMN]
+            tp = type(is_valid)
+            if tp is bool: return is_valid
+
+            if issubclass(tp,status.Base): 
+                return is_valid.is_valid
+
+            raise TypeError()
+
+        df = self._df
+        df[VALID_COLUMN]  = df.apply(update, axis=1)
+    
+        fpath = os.path.join(self._logs_dpath, 'test.csv')
+        Table.write_df(self._df, fpath)
+
+        # Updating statuses in Structure object
+        df_dir = df[~np.isnan(df[LEAF_ID_COLUMN])]
+        cols=[LEAF_ID_COLUMN, STATUS_COLUMN]
+        for id, status in df_dir[cols].values: 
+            self._df_idmap[id].status = status
 
 
+    def __sort_df(self, df):
+
+        is_sorted = np.all([a==b for a, b in zip(df.columns, self._start_columns)])
+
+        if not is_sorted:
+            for n in reversed(self._start_columns):
+                if n in df.columns:
+                    df = df[[n] + [c for c in df.columns if not c == n]]
+
+        return df.sort_values(by=self._sort_columns)
 
     @classmethod
     def read_table_map(cls, fpath, logger, maps, dtypes):
@@ -54,43 +103,45 @@ class Table:
 
         return df.astype(dtypes)
 
+    def sync_table_maps(self, batch):
 
-    def match_to_table_map(self, batch):
+        fpath = batch._args.table_path
+        tmaps =  batch._tmaps
+        logger = self._logger
+        dtypes = self._dtypes
+        dstruc = batch._dstruc
 
-        ####################################################
-        # TODO: Figure out suffix/job_id inclusion/sorting #
-        ####################################################
-        fpath, logger = batch._args.table_path, batch._logger 
-        dmaps, tmaps = batch._dmaps, batch._tmaps
+        self._smaps.append(Status)
+        logger.banner("Matching Directories to Table") 
+        df_tbl = Table.read_table_map(fpath, logger, tmaps, dtypes)
+        df_only_tbl = self.__sync_and_extract_no_match(df_tbl)
+        logger.info("Directories matched to table entries.")
+
+        if len(df_only_tbl) == 0: return
+
+        logger.info("Updating Directory Tree")
+        count = dstruc.update_from_table(df_only_tbl)
+        
+        logger.warning("%d entries from table added to directory tree." % (count))     
+
+
+    def __sync_and_extract_no_match(self, df_tbl):
+        # Updating chain statuses with Table Status
+        logger = self._logger
+        dmaps = self._dmaps
         logs_dpath = self._logs_dpath
         df_dir = self._df
-        self._dtypes = dtypes = {m.name: m.dtype for m in dmaps}
-        df_tbl = Table.read_table_map(fpath, logger, tmaps, dtypes)
 
-        logger.banner("Matching Directories to Table") 
-        df_both, df_only_dir, df_only_tbl = self._match_to_directories(df_tbl)
+        df_both, df_only_dir, df_only_tbl = self.__merge_split(df_tbl, dmaps)
 
-        if len(df_both) == 0: logger.error("No directories matched to table at path '%s'." % self._fpath)
+        if len(df_both) == 0: logger.error("No directories matched to table at path '%s'." % self._table_fpath)
 
         def init_table(df, status):
-            df['status'] = status
-            df[UPDATE_COLUMN] = self._n_updates
+            df[STATUS_ID_COLUMN] = self._smaps.get_id(status)
+            df[STATUS_COLUMN] = status
             df[VALID_COLUMN] = status.is_valid
-
-            sort_columns = ([m.name for m in dmaps])
-            sort_columns.append('status')
-    
-            # Put sorting columns at start of table
-            sort_columns = [c for c in sort_columns if c in df.columns]
-            for n in reversed(sort_columns):
-                if n in df.columns:
-                    df = df[[n] + [c for c in df.columns if not c == n]]
-
-            return df.sort_values(by=sort_columns)
-
-
-
-
+            return self.__sort_df(df)
+            
         df_both     = init_table(df_both    , Status.BOTH    )
         df_only_dir = init_table(df_only_dir, Status.DIR_ONLY)
         df_only_tbl = init_table(df_only_tbl, Status.TBL_ONLY)
@@ -98,13 +149,21 @@ class Table:
         Table.log_missing(df_only_dir, logs_dpath, "orphan_directories.csv", "directories did not match to table entries", df_dir, logger)
         Table.log_missing(df_only_tbl, logs_dpath, "orphan_table_rows.csv" , "table entries did not match to directories", df_tbl, logger)
 
+        df = pd.concat([df_both, df_only_dir, df_only_tbl], ignore_index=True)
+        self._df = self.__sort_df(df)
+
+        self.propagate_statuses()
+
+        return df_only_tbl
 
     @classmethod 
     def write_df(cls, df, fpath):
 
         df = df.copy()
-        df['status'] = ["[%d] %s" % (n, s.display_string) for s, n in zip(df['status'], df[UPDATE_COLUMN])]
-        df = df.drop(columns=[UPDATE_COLUMN, VALID_COLUMN])
+
+        stat_info =[x for x in zip(df[STATUS_COLUMN], df[STATUS_ID_COLUMN])]
+        df[STATUS_COLUMN] = ["[%d] %s" % (n, s.display_string) for s, n in stat_info]
+        df = df.drop(columns=[STATUS_ID_COLUMN, VALID_COLUMN])
         df.to_csv(fpath, index=False)
 
     @classmethod
@@ -119,21 +178,20 @@ class Table:
         cls.write_df(df1, fpath)
 
 
-    def _match_to_directories(self, df_tbl):
+    def __merge_split(self, df_tbl, dmaps):
 
         df_dir = self._df
 
+        #print(self._df)
         # Columns ready for matching
-        match_cols = [k for k, v in self._dtypes.items() if not v is float]
+        match_cols = [d.name for d in dmaps if not d.parser.dtype is float]
 
-        # Number of decimals places for floats to be marked the same
-        N_MATCH_DIGITS = 8
-        # Creating temporary 'integerized' version of type float columns
-        flt_cols = [k for k, v in self._dtypes.items() if v is float]
-        tmp_cols = ["%s_TEMP_FLOAT_INT" % c for c in flt_cols]
-        for c, tc in zip(flt_cols, tmp_cols):
-            df_tbl[tc] = (df_tbl[c]*10**N_MATCH_DIGITS).astype(int)
-            df_dir[tc] = (df_dir[c]*10**N_MATCH_DIGITS).astype(int)
+        flt_cols = [(d.name, d.parser) for d in dmaps if d.parser.dtype is float]
+        tmp_cols = ["%s__TEMP_COMPARE__" % n for n, _ in flt_cols]
+
+        for (t, parser), tc in zip(flt_cols, tmp_cols):
+            df_tbl[tc] = df_tbl[t].apply(parser.raw_reverse)
+            df_dir[tc] = df_dir[t].apply(parser.raw_reverse)
 
         # Appending 'integerized' columns for merge
         match_cols.extend(tmp_cols)
@@ -150,8 +208,8 @@ class Table:
         df_both = self.__clean_df(df_both, tmp_cols, *suffixes)
 
         # Removing extra NaN columns gain for Directory Dataframe
-        extra_drops = [c for c in df_dir.columns if c in df_only_tbl.columns]
-        df_only_tbl = self.__clean_df(df_only_tbl, tmp_cols, '_dir_map', '_tbl_map', extra_drops)
+        extra_drops = [c for c in df_dir.columns if c in df_only_tbl.columns and c not in match_cols]
+        df_only_tbl = self.__clean_df(df_only_tbl, tmp_cols, *reversed(suffixes), extra_drops)
 
         # Removing extra NaN columns gained from CSV/Table Dataframe
         extra_drops = [c for c in df_tbl.columns if c in df_only_dir.columns and c not in match_cols]

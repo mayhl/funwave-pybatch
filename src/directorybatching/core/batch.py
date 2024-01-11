@@ -2,7 +2,8 @@
 import directorybatching.core.directory as directory
 import directorybatching.core.table as table
 import directorybatching.core.param as param
-import directorybatching.core.misc as misc 
+import directorybatching.core.status as status
+import directorybatching.core.misc as misc
 from directorybatching.core.logger import MultiLogger, BufferedLogger
 
 import argparse
@@ -151,6 +152,7 @@ class Batch(ABC):
         ###############################################
         logger.banner("Validating & Constructing Maps")
         ###############################################
+        self._status_maps = status.Chained()
         self._dmaps = self.__construct_dir_maps()
         self._tmaps, self._is_tmaps = self.__construct_table_maps()
         self._pmaps, self._ptype, self._is_pmaps = self.__construct_param_maps()
@@ -167,7 +169,16 @@ class Batch(ABC):
         
 
         self._table = table.Table(self)
-        self._table.match_to_table_map(self)
+
+        if self._is_tmaps: self._table.sync_table_maps(self)
+
+        #if self._is_tmap:
+            #df_only_tbl= self._table.match_to_table_map(self)
+            #self._dstruc.update_from_table(df_only_tbl)
+        
+            #self._dstruc._update_status()
+
+            #self._dstruc.print_tree_status('test')
         #if self._table: table.Table.match_to_directories(self, df, df_idmap),
 
         #if self._is_tmaps: table.Table.match_to_directories(self, df, df_idmap),

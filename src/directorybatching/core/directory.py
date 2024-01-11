@@ -11,8 +11,11 @@ from enum import Enum
 import pandas as pd
 from types import SimpleNamespace
 
-Map = namedtuple("DirectoryMap", "name dir_name parser dtype")
+Map = namedtuple("DirectoryMap", "name dir_name parser")
 
+
+LEAF_ID_COLUMN = 'batch_dir_leaf_id'
+STATUS_COLUMN  = 'status'
 
 class Status(status.Base):
 
@@ -59,20 +62,21 @@ class Structure:
                 logs = batch.dpaths.logs)
 
         self._logger = batch.logger
+        self._smaps = batch._status_maps
+        self._smaps.append(Status)
 
-        maps = batch._dmaps
+        self._dmaps = dmaps = batch._dmaps
         root_dpath = batch.dpaths.root
 
         self._root = Node(root_dpath, is_valid=Status.VALID, dpath=root_dpath, is_vleaf=False)
         self._n_updates = 0
-        self.__build_tree(root_dpath, maps)
-        self.__check_tree_depth(maps)
+        self.__build_tree(root_dpath, dmaps)
+        self.__check_tree_depth(dmaps)
 
-        self._dtypes = {m.name: m.dtype for m in maps}
+        self._dtypes = {m.name: m.parser.dtype for m in dmaps}
 
     @property
     def dpaths(self): return self._dpaths
-
 
     @property
     def leafs(self):
@@ -82,51 +86,161 @@ class Structure:
     def vleafs(self):
         return [n for n in PostOrderIter(self._root, filter_=lambda n: n.is_vleaf)]
 
-    def to_dataframe(self):
+    ###########################
+    # Directory/Table Methods #
+    ###########################
 
+    def to_dataframe(self, ids=None):
+
+        if not ids is None: raise NotImplementedError()
+   
         leafs = self.leafs
-        data = [self.__leaf_to_dict(l, id) for id, l in enumerate(leafs)]
-        map = {r['dir_id']: l for r, l in zip(data,leafs)}
+        if ids is None: ids = list(range(len(leafs)))
 
+        data = [self.__leaf_to_dict(l, id) for id, l in zip(ids, leafs)]
+        map = {r[LEAF_ID_COLUMN]: l for r, l in zip(data,leafs)}
+        
         df = pd.DataFrame.from_records(data).astype(self._dtypes)
-
+        df[LEAF_ID_COLUMN] = df[LEAF_ID_COLUMN].astype(int)
         return df, map
 
-    def __leaf_to_dict(self, l, map_id):
+    def __leaf_to_dict(self, l, id):
 
-        total = {'dir_id': map_id} 
+        total = {LEAF_ID_COLUMN: id, 
+                 STATUS_COLUMN : l.status} 
         while not l.is_root:
-            total.update({k: v for k, v in l.rtnval.items() if not k =='value'})
-            total[l.bname] = l.rtnval['value'] 
+            total.update(l.rtnval)
             l = l.parent
 
         return total
+
+    def update_from_table(self, df):
+
+        COMPARE_TAG = "%s__TEMP_COMPARE__"
+        info =[]
+        for m in self._dmaps:
+            p = m.parser
+            if p.dtype is float:
+                compare_col = COMPARE_TAG % m.name
+                df[compare_col]=df[m.name].apply(p.raw_reverse)
+            else:
+                compare_col = m.name
+            info.append((m, compare_col))
+            
+        count = self._update_from_table(self._root, df, info)
+        return count 
+    def _update_from_table(self, p, df, info):
+
+        if len(info) == 0: return 0 
+
+        dmap, comp_col = info[0]
+        logger = self._logger
+
+        if np.any([not c.bname==dmap.dir_name for c in p.children]):
+            raise logger.critical("Directory maps order didn't match "\
+                                  "tree structure.", TypeError)
+
+        t_vals = np.unique(df[comp_col].values)
+        d_vals = [c.rtnval[dmap.name] for c in p.children]
+
+        
+        is_float = dmap.parser.dtype is float
+        if is_float:
+            reverse = dmap.parser.raw_reverse
+            d_vals = [reverse(v) for v in d_vals]
+
+        new_vals = [v for v in t_vals if not v in d_vals]
+
+
+        is_last = len(info) == 1
+        if len(new_vals) > 0:
+            for val in new_vals:
+                self.__add_table_node(p, val, df, dmap, is_float, is_last)
+
+        n_count = 0
+        for c in p.children:
+            val = c.rtnval[c.bname]
+            if is_float: val = reverse(val)
+            sub_df = df[df[comp_col]==val]
+            if len(sub_df) == 0: continue
+            n_count += self._update_from_table(c, sub_df, info[1:])
+
+        return len(new_vals) if is_last else n_count
+
+    def __add_table_node(self, p, val, df, dmap, is_float, is_last):
+
+        logger = self._logger 
+        if is_float:
+            forward = dmap.parser.raw_forward
+            val = forward(val)
+        
+        has_preproc = dmap.parser.has_preprocessor
+        rtnval = {dmap.name: val}
+        name = dmap.parser.reverse(dmap.name, rtnval, has_preproc)
+
+
+        is_vleaf = is_last and has_preproc
+        status = df.iloc[0][STATUS_COLUMN] if is_last and not is_vleaf else None
+
+        args = (False, None, status, dmap.name, is_vleaf, rtnval)
+        attrs = Structure.__gen_node_attrs(*args)
+
+        c = Node(name, p, **attrs)
+        logger.debug("Added node %s" % c)
+
+        if is_vleaf:
+            status = df.iloc[0][STATUS_COLUMN]
+            is_vleaf = False 
+            name = "__DUMMY__"
+            rtnval = {'jobid': "__DUMMY__"} 
+            
+            args = (False, None, status, name, is_vleaf, rtnval)
+            attrs = Structure.__gen_node_attrs(*args)
+            gc = Node(name, c, **attrs)
+            logger.debug("Added virtual node %s" % gc)
+
+
+
+
+    ####################
+    # Internal methods #
+    ####################
 
     def _update_status(self, p=None):
         if p is None: 
             p = self._root
             self._n_updates += 1
 
-        if not p.is_leaf:
-            statuses =  np.array([self._update_status(c) for c in p.children])
+        if not p.is_leaf or p.is_vleaf:
 
-            if Status.all_valid(statuses):
-                p.status = Status.VALID
-            elif Status.any_valid(statuses):
-                p.status = Status.INVALID
-            else:
-                p.status = Status.PARTIAL
+            ids, is_valids = zip(*[self._update_status(c) for c in p.children])
 
-        elif p.is_vleaf:
-            statuses =  np.array([self._update_status(c) for c in p.children])
-            p._status = Status.min(statuses)
+            self._is_valid = is_valid = Status.max(is_valids)
 
-        return p.status 
+            id_max = np.max(ids)
+            id_min = np.min(ids)
+
+            p._status_max = self._smaps.get_status(id_max)
+            p._status_min = self._smaps.get_status(id_min)
+
+            p.status = p._status_max
+            id = id_max
+
+        else:
+
+            id = self._smaps.get_id(p.status)
+            is_valid   = p.is_valid
+          
+            if type(p.is_valid) is bool:
+                is_valid = Status.VALID if is_valid else Status.INVALID
+                p.is_valid = is_valid
+
+        return id, is_valid
 
     def print_tree_status(self, name=None):
 
         marks = {Status.VALID  : colored('✓', 'green' ),
-                 Status.INVALID: colored('x', 'red'   ),
+                 Status.INVALID: colored('x', 'red'   ), 
                  Status.PARTIAL: colored('-', 'yellow')}
 
         log_fname = "filter_stage_%02d" % self._n_updates
@@ -136,7 +250,7 @@ class Structure:
 
         with open(log_fpath, 'w') as f:
             for pre, _, node in RenderTree(self._root):
-                mark = marks[node.status]
+                mark = marks[node.is_valid] 
                 f.write("%s [%s] %s\n" % (pre, mark, node.name))
 
     def filter_valid(self, name=None):
@@ -147,17 +261,17 @@ class Structure:
         leafs = self.leafs
         
         nt = len(leafs)
-        are_valid = [l.status.is_valid for l in leafs]
+        are_valid = [l.is_valid.is_valid for l in leafs]
         nv = np.sum(are_valid)
         nr = nt - nv
 
         self._logger.info("Removing %d out of %d leafs in filter stage %d '%s'."  % (nr, nt, self._n_updates, name))
 
-        for l, is_valid in zip(leafs, are_valid):
-            if not is_valid: self.remove_leaf(l)
+        #for l, is_valid in zip(leafs, are_valid):
+         #   if not is_valid: self.remove_leaf(l)
 
 
-    def remove_leaf(self, l):
+    def __remove_leaf(self, l):
         logger = self._logger
         if not l.is_leaf:
             logger.critical("Can not remove leaf as it is not a leaf, '%s%'" % l.dpath)
@@ -180,25 +294,34 @@ class Structure:
             logger.debug("Removed parent node '%s' since it has no children after removing child '%s'." % (p.dpath, l.name)) 
             self.remove_leaf(p)
 
+    @classmethod
+    def __gen_node_attrs(cls, is_valid, dpath, status, bname,
+                       is_vleaf=False, rtnval={}):
+
+        status = Status.VALID if is_valid else Status.INVALID
+        attrs = {'dpath'   : dpath   ,
+                 "status"  : status  ,
+                 "bname"   : bname   ,
+                 "is_valid": status  ,
+                 "is_vleaf": is_vleaf,
+                 'rtnval'  : rtnval  }
+
+        return attrs
+
     def __process_subdir(self, sub_dname, dpath, map, is_last):
 
-        def qreturn(is_valid, rtnvalue={}, is_vleaf=False):
-
-            status = Status.VALID if is_valid else Status.INVALID
-            attrs = {'dpath'   : sub_dpath   ,
-                     "status"  : status      ,
-                     "bname"   : map.dir_name,
-                     "is_vleaf": is_vleaf    ,
-                     'rtnval'  : rtnval       }
-
-            return is_vleaf, (sub_dname, attrs)
+        def qreturn(is_valid, name=sub_dname, rtnvalue={}, is_vleaf=False): 
+            args = (is_valid, sub_dpath, status, map.dir_name, is_vleaf, rtnval)
+            attrs = Structure.__gen_node_attrs(*args)
+            return is_vleaf, (name, attrs)
 
         logger = self._logger
         sub_dpath = os.path.join(dpath, sub_dname)
 
         try:
-            rtnval = map.parser(map.dir_name, sub_dname)
+            rtnval = map.parser.forward(map.dir_name, sub_dname)
         except Exception as e:
+            raise e
             logger.config("Subfolder '%s' caused an error in the parser for directory map '%s' "\
                           "at path '%s'." % (sub_dname, map.dir_name, dpath)                     )
 
@@ -211,18 +334,11 @@ class Structure:
             logger.config("Parser for directory map, '%s', did not return a dict: got "\
                           "type '%s'." % (map.dir_name, type(rtn_val)))
     
-        # FUTURE IDEA: Remove value keyword restriction
-        if not 'value' in rtnval:
+        if not map.dir_name in rtnval:
             logger.config("Parser for directory map, '%s', did not return dict with: "\
-                          "keyword 'value'." % (map.dir_name)                          )
+                          "corresponding keyword '%s'." % (map.dir_name, map.dir_name)              )
 
-        is_vname = 'virtual_name' in rtnval
-        is_vval  = 'virtual_value' in rtnval
-        is_vleaf = is_vname and is_vval
-
-        if not is_vname == is_vval:
-            logger.config("Parser for directory map, '%s', return a dict with incomplete "\
-                          "virtual directory keywords." % (map.dir_name))
+        is_vleaf = 'virtual' in rtnval
 
         if is_last and not is_vleaf:
             logger.config("Parser for last directory map, '%s', did not return a virtual "\
@@ -232,7 +348,9 @@ class Structure:
             logger.config("Parser for directory map, '%s', returned a dictionary with virtual "\
                           "directory keywords when it should not have." % (map.dir_name))
 
-        return qreturn(True, rtnval, is_vleaf)
+
+        name = map.parser.reverse(map.dir_name, rtnval, True) if is_vleaf else sub_dname 
+        return qreturn(True, name, rtnval, is_vleaf)
 
     def __build_tree(self, dpath, maps, parent=None):
 
@@ -274,19 +392,20 @@ class Structure:
                 if not name in subnodes: 
                     pattrs = copy.deepcopy(attrs)
                     pattrs['dpath'] = None
-                    del pattrs['rtnval']['virtual_name']
-                    del pattrs['rtnval']['virtual_value']
+                    del pattrs['rtnval']['virtual']
 
                     subnodes[name] = {'attrs': pattrs, 'children': []}
                 
                 attrs['is_vleaf'] = False
-                attrs['bname'] = attrs['rtnval']['virtual_name']
-                attrs['value'] = attrs['rtnval']['virtual_value']
-                vname = attrs['rtnval']['virtual_name']
-                del attrs['rtnval']['virtual_name']
-                del attrs['rtnval']['virtual_value']
 
-                subnodes[name]['children'].append((vname, attrs))
+                vattr = attrs['rtnval']['virtual']
+                if not len(vattr) == 1: raise Exception()
+                vname, vvalue = list(vattr.items())[0]
+                attrs['bname'] = vname
+                attrs['value'] = vvalue
+                del attrs['rtnval']['virtual']
+                
+                subnodes[name]['children'].append((vvalue, attrs))
 
             # Creating children and grandchildren
             for cname in subnodes:

@@ -59,6 +59,7 @@ class Base(Enum, metaclass=ABCEnumMeta):
     def any_valid(cls, statuses):
         return np.any([s.is_valid for s in statuses])
 
+
     @classmethod
     def max(cls, statuses):
         max_id = np.max([s.id for s in statuses])
@@ -68,4 +69,64 @@ class Base(Enum, metaclass=ABCEnumMeta):
     def min(cls, statuses):
         min_id = np.min([s.id for s in statuses])
         return cls.get_by_id(min_id)
+
+
+class Chained:
+
+    def __init__(self):
+        self._statuses = {}
+    
+    def _get_key(self, status):
+        return status
+
+    def get_id(self, status):
+        key = self._get_key(type(status))
+        offset = self._statuses[key]['id_start']
+        return status.id + offset
+
+    def get_status(self, id):
+
+        for key in self._statuses:
+            id_start = self._statuses[key]['id_start']
+            id_end   = self._statuses[key]['id_end']
+            if id_start <= id and id < id_end:
+                return self._statuses[key]['class'].get_by_id(id-id_start)
+
+        raise TypeError("ID %d can not be matched to a Chained status." % id )
+    
+    def has(self, status):
+        return type(status) in self._statuses
+
+    def append(self, derived_type):
+
+        if not issubclass(derived_type, Base):
+            raise TypeError("Can only append Statuses derivied from base, got '%s'." % derived_type)
+
+        if derived_type in self._statuses: raise Exception()
+
+        ids = np.array([s.id for s in derived_type])
+        id_max = ids.max()
+        id_min = ids.min()
+
+        if len(self._statuses) == 0:
+            id_start = 0
+        else:
+            id_start = np.max([s['id_end'] for k, s in self._statuses.items()])
+
+        id_start += id_min
+        id_end = id_start + (id_max - id_min) + 1
+
+        key = self._get_key(derived_type)
+        self._statuses[key] = {'id_start': id_start    , 
+                               'id_end'  : id_end      ,
+                               'class'   : derived_type}
+
+
+        
+
+
+
+
+
+
 
