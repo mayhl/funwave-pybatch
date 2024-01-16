@@ -3,16 +3,30 @@ import copy
 import os
 from anytree import Node, RenderTree, AsciiStyle, PostOrderIter
 from abc import ABC, abstractmethod
-from collections import namedtuple
 import numpy as np
 import logging
 from termcolor import colored
 from enum import Enum
 import pandas as pd
 from types import SimpleNamespace
+import pickle
+import sys
 
-Map = namedtuple("DirectoryMap", "name dir_name parser")
+class Map:
 
+    @property
+    def name(self): return self._name
+
+    @property
+    def dir_name(self): return self._dir_name
+
+    @property
+    def parser(self): return self._parser
+
+    def __init__(self, name, dir_name, parser):
+        self._name = name
+        self._dir_name = dir_name
+        self._parser = parser
 
 LEAF_ID_COLUMN = 'batch_dir_leaf_id'
 STATUS_COLUMN  = 'status'
@@ -86,6 +100,20 @@ class Structure:
     def vleafs(self):
         return [n for n in PostOrderIter(self._root, filter_=lambda n: n.is_vleaf)]
 
+    def save_to_file(self):
+        fpath = os.path.join(self._dpaths.out, 'directory_tree.pkl')
+
+        logger = self._logger
+        dmaps = self._dmaps
+        self._logger = None
+        self._dmaps = None
+        pickle.dump(self, open(fpath, 'wb'))
+        self._logger = logger
+        self._dmaps = dmaps
+
+
+
+
     ###########################
     # Directory/Table Methods #
     ###########################
@@ -97,19 +125,33 @@ class Structure:
         leafs = self.leafs
         if ids is None: ids = list(range(len(leafs)))
 
-        data = [self.__leaf_to_dict(l, id) for id, l in zip(ids, leafs)]
+        data = [self.__leaf_to_dict(*x) for x in zip(leafs, ids)]
         map = {r[LEAF_ID_COLUMN]: l for r, l in zip(data,leafs)}
         
         df = pd.DataFrame.from_records(data).astype(self._dtypes)
-        df[LEAF_ID_COLUMN] = df[LEAF_ID_COLUMN].astype(int)
+        df[LEAF_ID_COLUMN] = df[LEAF_ID_COLUMN].astype(np.int_)
         return df, map
+
+    def get_leaf_id(self, l):
+
+        if not l.is_leaf: raise Exception() 
+
+        input = ()
+        while not l.is_root:
+            input += (l.bname, l.rtnval[l.bname])
+            l = l.parent
+
+        return hash(input) % ((sys.maxsize + 1)*2)
+        
 
     def __leaf_to_dict(self, l, id):
 
         total = {LEAF_ID_COLUMN: id, 
                  STATUS_COLUMN : l.status} 
+        hash_input = ()
         while not l.is_root:
             total.update(l.rtnval)
+            hash_input += (l.bname, l.rtnval[l.bname])
             l = l.parent
 
         return total
@@ -127,11 +169,13 @@ class Structure:
                 compare_col = m.name
             info.append((m, compare_col))
             
-        count = self._update_from_table(self._root, df, info)
-        return count 
+        count, map = self._update_from_table(self._root, df, info)
+
+        return count, map 
+
     def _update_from_table(self, p, df, info):
 
-        if len(info) == 0: return 0 
+        if len(info) == 0: return 0, None 
 
         dmap, comp_col = info[0]
         logger = self._logger
@@ -143,7 +187,6 @@ class Structure:
         t_vals = np.unique(df[comp_col].values)
         d_vals = [c.rtnval[dmap.name] for c in p.children]
 
-        
         is_float = dmap.parser.dtype is float
         if is_float:
             reverse = dmap.parser.raw_reverse
@@ -151,21 +194,25 @@ class Structure:
 
         new_vals = [v for v in t_vals if not v in d_vals]
 
-
         is_last = len(info) == 1
+
+        id_maps = {}
         if len(new_vals) > 0:
             for val in new_vals:
-                self.__add_table_node(p, val, df, dmap, is_float, is_last)
-
+                tmp = self.__add_table_node(p, val, df, dmap, is_float, is_last)
+                if not tmp is None: id_maps.update(tmp)
+        
         n_count = 0
         for c in p.children:
             val = c.rtnval[c.bname]
             if is_float: val = reverse(val)
             sub_df = df[df[comp_col]==val]
             if len(sub_df) == 0: continue
-            n_count += self._update_from_table(c, sub_df, info[1:])
+            n, tmp = self._update_from_table(c, sub_df, info[1:])
+            n_count += n
+            if not tmp is None: id_maps.update(tmp)
 
-        return len(new_vals) if is_last else n_count
+        return len(new_vals) if is_last else n_count, id_maps
 
     def __add_table_node(self, p, val, df, dmap, is_float, is_last):
 
@@ -181,6 +228,7 @@ class Structure:
 
         is_vleaf = is_last and has_preproc
         status = df.iloc[0][STATUS_COLUMN] if is_last and not is_vleaf else None
+        leaf_id = df.iloc[0][LEAF_ID_COLUMN]
 
         args = (False, None, status, dmap.name, is_vleaf, rtnval)
         attrs = Structure.__gen_node_attrs(*args)
@@ -192,13 +240,15 @@ class Structure:
             status = df.iloc[0][STATUS_COLUMN]
             is_vleaf = False 
             name = "__DUMMY__"
-            rtnval = {'jobid': "__DUMMY__"} 
+            rtnval = {dmap.parser._preproc.name: "__DUMMY__"} 
             
             args = (False, None, status, name, is_vleaf, rtnval)
             attrs = Structure.__gen_node_attrs(*args)
             gc = Node(name, c, **attrs)
             logger.debug("Added virtual node %s" % gc)
+            return {leaf_id: gc}
 
+        if is_last: return {leaf_id: c}
 
 
 
@@ -400,10 +450,14 @@ class Structure:
 
                 vattr = attrs['rtnval']['virtual']
                 if not len(vattr) == 1: raise Exception()
+
+                del attrs['rtnval'][attrs['bname']]
+                del attrs['rtnval']['virtual']
+
                 vname, vvalue = list(vattr.items())[0]
                 attrs['bname'] = vname
                 attrs['value'] = vvalue
-                del attrs['rtnval']['virtual']
+                attrs['rtnval'].update({vname: vvalue})
                 
                 subnodes[name]['children'].append((vvalue, attrs))
 

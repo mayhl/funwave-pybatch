@@ -256,8 +256,8 @@ class Decimal(ValidatorParser):
         if type(digits) is str:
             raise NotImplementedError()
         else:
-            pow = digits + offset - 1
-            fmt = '%%0%dd' % digits
+            pow = digits + offset
+            fmt = '%%0%dd' % (digits + 1)
             forward = lambda x: float(s*int(x)*10**-pow)
             reverse = lambda x: fmt % (s*x*10**pow)
             parser = ValueParser(forward, reverse, float)

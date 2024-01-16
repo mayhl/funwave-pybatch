@@ -95,7 +95,7 @@ class Chained:
         raise TypeError("ID %d can not be matched to a Chained status." % id )
     
     def has(self, status):
-        return type(status) in self._statuses
+        return status in self._statuses
 
     def append(self, derived_type):
 

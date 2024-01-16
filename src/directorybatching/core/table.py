@@ -20,6 +20,8 @@ STATUS_ID_COLUMN = 'batch_status_id'
 VALID_COLUMN  = "batch_is_row_still_valid"
 STATUS_COLUMN = "status"
 LEAF_ID_COLUMN = "batch_dir_leaf_id"
+FILES_COLUMN = 'job_files'
+
 class Table:
 
     def __init__(self, batch):
@@ -29,6 +31,9 @@ class Table:
         self._smaps = batch._status_maps
         self._dmaps = batch._dmaps
         self._logger = batch.logger
+
+        self._data_dpath = os.path.join(batch.dpaths.out, 'aggregate_data.csv')
+
         # Tree representation of directory structure 
         #self._dstruct = batch._dstruc
         # df       - Dataframe of directory parameters read 
@@ -40,6 +45,7 @@ class Table:
         df = self._df
         df[STATUS_ID_COLUMN] = df[STATUS_COLUMN].apply(self._smaps.get_id) 
         df[VALID_COLUMN] = True
+        df[FILES_COLUMN] = None
 
         # Configuring dataframe column arrangement and row sorting 
         cols = ([m.name for m in batch._dmaps])
@@ -48,7 +54,7 @@ class Table:
         self._df = self.__sort_df(self._df)
         
 
-    def propagate_statuses(self):
+    def sync_data(self, updates={}, new_rtnvals={}):
 
         def update(row):
 
@@ -56,22 +62,112 @@ class Table:
             tp = type(is_valid)
             if tp is bool: return is_valid
 
-            if issubclass(tp,status.Base): 
+            if issubclass(tp, status.Base): 
                 return is_valid.is_valid
 
             raise TypeError()
 
         df = self._df
         df[VALID_COLUMN]  = df.apply(update, axis=1)
-    
-        fpath = os.path.join(self._logs_dpath, 'test.csv')
-        Table.write_df(self._df, fpath)
+        Table.write_df(df, self._data_dpath)
+        self._df = df
 
-        # Updating statuses in Structure object
-        df_dir = df[~np.isnan(df[LEAF_ID_COLUMN])]
-        cols=[LEAF_ID_COLUMN, STATUS_COLUMN]
-        for id, status in df_dir[cols].values: 
-            self._df_idmap[id].status = status
+        if len(updates) > 0:
+            for id, vals in updates.items():
+                for name, val in vals.items():
+                    setattr(self._df_idmap[id], name, val)
+        else:
+            for id, status in self._df[[LEAF_ID_COLUMN, STATUS_COLUMN]].values:
+                self._df_idmap[id].status = status
+
+
+        if len(new_rtnvals) > 0:
+            for id, vals in new_rtnvals.items():
+                self._df_idmap[id].rtnval.update(new_rtnvals)
+
+
+    def prep_list_job_args(self):
+
+        df = self._df[self._df[VALID_COLUMN]]
+
+        # Hacky work around with int switch to float when 
+        # NaN in column (missing data)
+        leaf_ids = df[LEAF_ID_COLUMN].values.astype(np.longlong)
+
+        # Removing internal columns 
+        drop = [STATUS_ID_COLUMN, VALID_COLUMN, 
+                LEAF_ID_COLUMN  , STATUS_COLUMN,
+                FILES_COLUMN]
+        df = df.drop(columns=drop)
+
+        # Formatting args as a list 
+        dpaths = [self._df_idmap[id].dpath for id in leaf_ids]
+        records = df.to_dict('records')
+        return list(zip(leaf_ids, dpaths, records))
+
+    def update_from_jobs(self, jobs, results):
+
+
+        appends = []
+        updates = []
+        stypes = []
+        for j, r in zip(jobs, results):
+            updates.append({LEAF_ID_COLUMN: j._leaf_id   , 
+                            STATUS_COLUMN : r.status     ,
+                            FILES_COLUMN  : j._files      })#,
+                            #VALID_COLUMN  : r.is_continue})
+
+            appends.append({**{LEAF_ID_COLUMN: j._leaf_id}, 
+                            **r.job_params                })
+
+            stypes.append(type(r.status))
+
+        for stype in stypes:
+            if not self._smaps.has(stype): self._smaps.append(stype)
+        
+        df = self._df
+        
+        df_append = pd.DataFrame.from_records(appends)
+        if len(df_append.columns) > 1:
+            df = df.merge(df_append, how='left', on=LEAF_ID_COLUMN, suffixes=['', '__JOB__'])
+
+
+        df_update = pd.DataFrame.from_records(updates)
+
+        ids = df_update[LEAF_ID_COLUMN].values
+        cols = [c for c in df_update.columns if not c ==LEAF_ID_COLUMN]
+
+        def update_status(row):
+            if not row[LEAF_ID_COLUMN] in ids: return row[STATUS_COLUMN]
+            other = df_update[df_update[LEAF_ID_COLUMN]==row[LEAF_ID_COLUMN]].iloc[0]
+            return other[STATUS_COLUMN]
+
+        for col in cols:
+
+            def update_status(row):
+                if not row[LEAF_ID_COLUMN] in ids: return row[col]
+                other = df_update[df_update[LEAF_ID_COLUMN]==row[LEAF_ID_COLUMN]].iloc[0]
+                return other[col]
+
+            df[col] = df.apply(update_status, axis=1)
+
+        def update_status_id(row):
+            if not row[LEAF_ID_COLUMN] in ids: return row[STATUS_ID_COLUMN]
+            return self._smaps.get_id(row[STATUS_COLUMN])
+        
+
+        #df[STATUS_COLUMN] = df.apply(update_status, axis=1)
+        df[STATUS_ID_COLUMN] = df.apply(update_status_id, axis=1)
+
+
+        appends = {i[LEAF_ID_COLUMN]: {k: v for k,v in i.items() if not k == LEAF_ID_COLUMN} for i in appends}
+        updates = {i[LEAF_ID_COLUMN]: {k: v for k,v in i.items() if not k == LEAF_ID_COLUMN} for i in updates}
+
+        #appends = {v: {k1: v1 for k1, v1 in appends if not k1==k} for k, v in appends.items() if k == LEAF_ID_COLUMN}
+        #print(appends)
+        self.sync_data(updates, appends)
+
+        
 
 
     def __sort_df(self, df):
@@ -117,12 +213,14 @@ class Table:
         df_only_tbl = self.__sync_and_extract_no_match(df_tbl)
         logger.info("Directories matched to table entries.")
 
-        if len(df_only_tbl) == 0: return
+        if len(df_only_tbl) > 0: 
+            logger.info("Updating Directory Tree")
+            count, new_id_map = dstruc.update_from_table(df_only_tbl)
+            self._df_idmap.update(new_id_map)
+            logger.warning("%d entries from table added to directory tree." % (count))    
 
-        logger.info("Updating Directory Tree")
-        count = dstruc.update_from_table(df_only_tbl)
-        
-        logger.warning("%d entries from table added to directory tree." % (count))     
+        self._df = self.__sort_df(self._df)
+        self.sync_data()
 
 
     def __sync_and_extract_no_match(self, df_tbl):
@@ -132,7 +230,13 @@ class Table:
         logs_dpath = self._logs_dpath
         df_dir = self._df
 
+        #df_tbl[LEAF_ID_COLUMN] = 0
+
         df_both, df_only_dir, df_only_tbl = self.__merge_split(df_tbl, dmaps)
+        
+        # Creating leaf ids for table only entries 
+        max_id = max(np.max(df_both[LEAF_ID_COLUMN].values), np.max(df_only_dir[LEAF_ID_COLUMN].values))
+        df_only_tbl[LEAF_ID_COLUMN] = np.arange(len(df_only_tbl)) + max_id + 1
 
         if len(df_both) == 0: logger.error("No directories matched to table at path '%s'." % self._table_fpath)
 
@@ -140,6 +244,8 @@ class Table:
             df[STATUS_ID_COLUMN] = self._smaps.get_id(status)
             df[STATUS_COLUMN] = status
             df[VALID_COLUMN] = status.is_valid
+            df[LEAF_ID_COLUMN] = df[LEAF_ID_COLUMN].astype(int)
+            # Merge resets to float
             return self.__sort_df(df)
             
         df_both     = init_table(df_both    , Status.BOTH    )
@@ -149,10 +255,12 @@ class Table:
         Table.log_missing(df_only_dir, logs_dpath, "orphan_directories.csv", "directories did not match to table entries", df_dir, logger)
         Table.log_missing(df_only_tbl, logs_dpath, "orphan_table_rows.csv" , "table entries did not match to directories", df_tbl, logger)
 
-        df = pd.concat([df_both, df_only_dir, df_only_tbl], ignore_index=True)
-        self._df = self.__sort_df(df)
 
-        self.propagate_statuses()
+        df = pd.concat([df_both, df_only_dir, df_only_tbl], ignore_index=True)
+        self._df = df
+        #cols = [LEAD_ID_COLUMN, STATUS_COLUMN]
+        #updates = {i: s for i, s in df_both[cols].values)
+        #updates.update({i: s for i,s in df_only_dir
 
         return df_only_tbl
 
@@ -161,8 +269,20 @@ class Table:
 
         df = df.copy()
 
-        stat_info =[x for x in zip(df[STATUS_COLUMN], df[STATUS_ID_COLUMN])]
-        df[STATUS_COLUMN] = ["[%d] %s" % (n, s.display_string) for s, n in stat_info]
+        #stat_info =[x for x in zip(df[STATUS_COLUMN], df[STATUS_ID_COLUMN])]
+        #df[STATUS_COLUMN] = ["[%d] %s" % (n, s.display_string) for s, n in stat_info]
+
+        def format_status(row):
+            string = "[%d] %s" % (row[STATUS_ID_COLUMN], row[STATUS_COLUMN].display_string)
+            if "msg" in row:
+                msg = row["msg"]
+                if not msg is None and not msg == "":
+                    string = "%s %s" % (string, msg)
+
+            return string
+
+        df[STATUS_COLUMN] = df.apply(format_status, axis=1)
+        
         df = df.drop(columns=[STATUS_ID_COLUMN, VALID_COLUMN])
         df.to_csv(fpath, index=False)
 
@@ -182,7 +302,6 @@ class Table:
 
         df_dir = self._df
 
-        #print(self._df)
         # Columns ready for matching
         match_cols = [d.name for d in dmaps if not d.parser.dtype is float]
 

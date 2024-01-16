@@ -1,7 +1,9 @@
 
 import directorybatching.core.directory as directory
+
+from directorybatching.core.parallel import simple as eparallel
 import directorybatching.core.table as table
-import directorybatching.core.param as param
+import directorybatching.core.job as job
 import directorybatching.core.status as status
 import directorybatching.core.misc as misc
 from directorybatching.core.logger import MultiLogger, BufferedLogger
@@ -13,6 +15,7 @@ from glob import glob
 import numpy as np
 import logging
 from types import SimpleNamespace
+import multiprocessing
 
 class Batch(ABC):
 
@@ -20,8 +23,8 @@ class Batch(ABC):
     # Methods to overwrite in derivied class #
     ##########################################
    
-    @abstractmethod
-    def process_sim(self, params, args): pass
+    #@abstractmethod
+    #def validate(self, params, args): pass
 
     # Defines: 
     #    1) common nested directory structure 
@@ -50,7 +53,7 @@ class Batch(ABC):
     # read at job path, e.g., model input parameters 
     def construct_param_maps(self): return None
 
-    def get_param_type(self): return None
+    def get_job_type(self): return None
 
 
     ####################
@@ -71,6 +74,73 @@ class Batch(ABC):
     #    Public methods    #
     ########################
 
+    def _update_jobs(self, jobs, results, name):
+
+        logger = self.logger
+
+        for j, r in zip(jobs, results):
+            j._params.update(r.job_params)
+            j._files.update(r.job_files)
+
+        self._table.update_from_jobs(jobs, results)
+        jobs = [j for j, r in zip(jobs, results) if r.is_continue]
+
+        self._dstruc.save_to_file()
+        all_errors = [r.status for r in results if not r.status.is_valid]
+
+        errors = []
+        for e in all_errors:
+            if not e in errors: errors.append(e)
+
+        n = len(results)
+        for e in errors:
+            ne = np.sum(all_errors==e)
+            if ne == 0: continue
+            
+            p = 100*ne/n
+            logger.warning("%d/%d [%.1f%%] jobs failed %s with status '%s'." % (ne, n, p, name, e.display_string)) 
+
+        is_no_error = len(errors) == 0
+        is_no_jobs = len(jobs) == 0
+
+        if is_no_jobs and not is_no_error:
+            logger.error("No jobs passed %s" % name)
+
+        self._is_no_jobs = is_no_jobs 
+        if is_no_jobs:
+            logger.banner("All Jobs Completed")
+
+        if is_no_error:
+            logger.info("All jobs passed %s" % name)
+        else:
+            nj = len(jobs)
+            p = 100*nj/n
+            logger.warning("%d/%d [%.1f%%] jobs passed %s" % (nj, nj, p, name))
+
+        return jobs
+
+    def run(self):
+
+        logger = self.logger
+        n_procs = self._args.num_procs
+
+        logger.banner("Validating Jobs")
+        list_args = self._table.prep_list_job_args()
+        jobs = [self._jtype(*args, self._args, self._jmaps, self._mlogs, self._logger) for args in list_args]
+
+        def log_callback(rtnval):
+
+            msg = rtnval.status.name
+            logger.info("Job %s [%s] path: %s" % (rtnval.leaf_id, msg, rtnval.dpath))
+
+        results = eparallel([j.validate for j in jobs], n_procs, 'Validating', callback=log_callback)
+        jobs = self._update_jobs(jobs, results, 'validation')
+
+        logger.banner("Executing Jobs")
+        results = eparallel([j.execute for j in jobs], n_procs, 'Executing ', callback=log_callback)
+        jobs = self._update_jobs(jobs, results, self._name)
+
+
     def __init_directory(self):
 
         DNAMES = SimpleNamespace(
@@ -90,17 +160,11 @@ class Batch(ABC):
 
         out_dpath = misc.create_subdir(root_dpath, DNAMES.BATCH)
 
-        name = self._name
-        if not name is None: 
-            if not type(name) is str:
-                self._logger.config("Constructor input 'name' must be a string, got type '%s'" % type(name))
-
-            out_dpath = misc-crerate_subdir(out_dpath, name)
-
         logs_dpath = misc.create_subdir(out_dpath, DNAMES.LOGS)
         backlogs_dpath = misc.create_subdir(out_dpath, DNAMES.BACKLOGS)
 
-        log_fpath = os.path.join(logs_dpath, 'main.log')
+        name = "main" if self._name is None else self._name
+        log_fpath = os.path.join(logs_dpath, '%s.log' % name)
 
         dpaths = SimpleNamespace(
                     root    = root_dpath    ,
@@ -115,20 +179,21 @@ class Batch(ABC):
     def __init_logger(self, mlog, lvl): 
 
         if mlog is None: 
-            mlog = MultiLogger(self.dpaths.logs, self.dpaths.backlog, self._is_refresh, self._is_backlog)
+            mlog = MultiLogger(self.dpaths.logs, self.dpaths.backlog, self._is_refresh, self._is_backlog, lvl)
         else:
             t_mlog = type(mlog)
             if not t_mlog is MultiLogger: 
-                self.logger.crtical("Expected type MultiLogger for input multi_logger, got type '%s'." % t_mlog, TypeError)
+                self.logger.critical("Expected type MultiLogger for input multi_logger, got type '%s'." % t_mlog, TypeError)
 
-        logger = mlog.new(self._name, self._fpaths.log, self._logger, lvl=lvl)
+        # Note: Need to give name to avoid all logs writting to root logger
+        name = "MAIN" if self._name is None else self._name 
+        logger = mlog.new(name, self._fpaths.log, self._logger)
 
         return logger, mlog
 
-    def __init__(self, name=None, multi_logger=None):
+    def __init__(self, job_class, name=None, multi_logger=None):
 
         self._name = name
-
         self._args = self.__parse_batch_cmd_args() 
 
         self._is_refresh = self._args.refresh
@@ -155,7 +220,7 @@ class Batch(ABC):
         self._status_maps = status.Chained()
         self._dmaps = self.__construct_dir_maps()
         self._tmaps, self._is_tmaps = self.__construct_table_maps()
-        self._pmaps, self._ptype, self._is_pmaps = self.__construct_param_maps()
+        self._jmaps, self._jtype, self._is_jmaps = self.__construct_job_maps(job_class)
 
         self.__check_dir_table_maps()
         logger.info("Map validated and constructed.")
@@ -165,33 +230,10 @@ class Batch(ABC):
         #####################################################
         self._dstruc = directory.Structure(self)
         logger.info("Root directory crawled and validated")
-
-        
-
         self._table = table.Table(self)
 
+        # Syncing directory stucture to table  data
         if self._is_tmaps: self._table.sync_table_maps(self)
-
-        #if self._is_tmap:
-            #df_only_tbl= self._table.match_to_table_map(self)
-            #self._dstruc.update_from_table(df_only_tbl)
-        
-            #self._dstruc._update_status()
-
-            #self._dstruc.print_tree_status('test')
-        #if self._table: table.Table.match_to_directories(self, df, df_idmap),
-
-        #if self._is_tmaps: table.Table.match_to_directories(self, df, df_idmap),
-
-
-
-
-        
-
-
-
-    def run(self):
-        pass
 
     
     ##########################
@@ -203,14 +245,14 @@ class Batch(ABC):
   
         parser = argparse.ArgumentParser()
         
-        parser.add_argument('-np', '--num-proc', type=int,
-                            help="Number of processors")
+        parser.add_argument('-np', '--num-procs', type=int, default = 1,
+                            help="Number of processors, default: %d" % 1)
         parser.add_argument('-rp', '--root-path', type=str,
                             help="Path to root directory of subdirectories to process")
         parser.add_argument('-op', '--output-path', type=str, default=None,
                             help="Path to directory for aggregated simulations outputs.")
         parser.add_argument('-ll', '--log-level', type=int, default=logging.INFO, 
-                            help="Level of logging, default value %d (%s)" % (logging.INFO, "logging.INFO"))
+                            help="Level of logging. Default: %d (%s)." % (logging.INFO, "logging.INFO"))
         parser.add_argument('--refresh', action='store_true',
                             help="Backup and start fresh run and re-run completed jobs.")
         parser.add_argument('--no-backup', action='store_true',
@@ -286,26 +328,26 @@ class Batch(ABC):
     def __construct_table_maps(self):
         return self.__check_maps_wrapper('construct_table_maps', table.Map, is_required=False)
 
-    def __construct_param_maps(self):
+    def __construct_job_maps(self, jtype):
 
         logger = self.logger
-        pmaps = self.__check_maps_wrapper('construct_param_maps', param.Map, is_required=False)
+        jmaps, is_jmaps = self.__check_maps_wrapper('construct_job_maps', job.Map, is_required=False)
+        if not is_jmaps: return None, None, False
 
-        if pmaps is None: return None, None, False
+        # Strict validating of get_job_type method if construct_job_maps is valid
+        # FIX LOGIC
+        #cname, ccls, irel, sname = self.__check_inherited_method('get_job_type', Batch, is_restricted=False)   
+        #jtype = self.get_job_type()
 
-        # Strict validating of get_param_type method if construct_param_maps is valid
-        cname, ccls, irel, sname = self.__check_inherited_method('get_param_type', Batch, is_restricted=True)   
-        ptype = self.get_param_type()
+        #if jtype is None:
+        #    logger.error("Method 'get_job_type' not implemented correctly in derived class '%s', returns None." % cname)
 
-        if ptype is None:
-            logger.error("Method 'get_param_type' not implemented correctly in derived class '%s', returns None." % cname)
+        if not issubclass(jtype, job.Job):
+            pname = misc.get_class_fullname(job.Job)
+            rname = misc.get_class_fullname(jtype)
+            logger.error("Method 'get_job_type' does not return a class derived from '%s', got '%s'." % (pname, rname) )
 
-        if not issubclass(ptype, param.Param):
-            pname = misc.get_class_fullname(param.Param)
-            rname = misc.get_class_fullname(ptype)
-            logger.error("Method 'get_param_type' does not return a class derived from '%s', got '%s'." % (pname, rname) )
-
-        return pmaps, ptype, True
+        return jmaps, jtype, True
 
 
     def __check_map_compatability(self, omaps, otname):

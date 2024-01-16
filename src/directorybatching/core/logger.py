@@ -28,17 +28,17 @@ class BaseLogger(logging.RootLogger):
     def fmt_critical(cls, msg):
         return "(CRITICAL) %s Please contact developer." % msg
 
-    def critical(self, msg, etype=Exception): 
+    def critical(self, msg, etype=Exception, is_force=False): 
         super().critical(msg)
-        raise etype(BaseLogger.fmt_critical(msg))
+        if self._is_except or is_force: raise etype(BaseLogger.fmt_critical(msg))
 
-    def error(self, msg, etype=Exception):
+    def error(self, msg, etype=Exception, is_force=False):
         super().error(msg)
-        raise etype(msg)
+        if self._is_except or is_force: raise etype(msg)
 
     def config(self, msg):
-        super().config(msg)
-        raise ConfigError(msg)
+        super().config(msg, is_force=False)
+        if self._is_except or is_force: raise ConfigError(msg)
 
     def banner(self, title):
         
@@ -58,23 +58,33 @@ class BaseLogger(logging.RootLogger):
         for m in [banner, title, banner]: super().banner(m)
     
     @classmethod
-    def getLogger(cls, name, fpath=None):
+    def getLogger(cls, name, lvl=logging.INFO, is_ignore=False, fpath=None):
         logger = logging.getLogger(name)
         logger.__class__ = BaseLogger
+        logger._is_except = not is_ignore
         if not fpath is None:
             logger._fpath = fpath
+
+        #### WERID BUG ###############################################
+        # Log level 0 with custom handler behaves like log level 30. #
+        # Does not seem to be an issues with other log levels.       # 
+        # Hacky solution until bug source idenitified                # 
+        if lvl == 0: lvl = -1                                        #
+        logger.setLevel(lvl)                                         #
+        ##############################################################
+
         return logger 
 
 # Logger to setup different files 
 class FileLogger(BaseLogger):
 
     @classmethod
-    def getLogger(cls, name, fpath, lvl=logging.info, fmt=None):
+    def getLogger(cls, name, fpath, lvl=logging.INFO, is_ignore=False, fmt=None):
 
         if fmt is None: fmt = MULTI_LOGGER_FORMAT
 
         # Casting logger 
-        logger = super().getLogger(name, fpath)
+        logger = super().getLogger(name, is_ignore=is_ignore, lvl=lvl, fpath=fpath)
         logger._class__ = FileLogger
 
         # Configuring logger
@@ -83,7 +93,7 @@ class FileLogger(BaseLogger):
 
         handler.setFormatter(formatter)
         logger.addHandler(handler)
-        logger.setLevel(lvl)
+        #logger.setLevel(lvl)
 
         return logger
 
@@ -129,7 +139,7 @@ class BufferedLogger(BaseLogger):
         if fmt is None: fmt = MULTI_LOGGER_FORMAT
 
         # 'Casting'
-        logger = super().getLogger(name)        
+        logger = super().getLogger(name, lvl=lvl)        
         logger.__class__ = BufferedLogger
         logger._buffer = []
 
@@ -140,23 +150,16 @@ class BufferedLogger(BaseLogger):
         handler.setFormatter(formatter)
         logger.addHandler(handler)
 
-        #### WERID BUG ###############################################
-        # Log level 0 with custom handler behaves like log level 30. #
-        # Does not seem to be an issues with other log levels.       # 
-        # Hacky solution until bug source idenitified                # 
-        if lvl == 0: lvl = -1                                        #
-        logger.setLevel(lvl)                                         #
-        ##############################################################
-
         return logger
 
 class MultiLogger:
 
-    def __init__(self, dpath, back_dpath, is_refresh, is_backlog):
+    def __init__(self, dpath, back_dpath, is_refresh, is_backlog, log_lvl=logging.INFO):
 
         self._dpath = dpath
         self._handler = None
         self._logs = {}
+        self._log_lvl = log_lvl
 
         self._dpath = dpath
         self._back_dpath = back_dpath
@@ -174,9 +177,10 @@ class MultiLogger:
             self._logger.error("Can not get logger with name '%' as it has not been created!" % name)
         return self._logs[name]
     
-    def new(self, name, fpath, parent_logger, lvl=logging.INFO, fmt=None):
+    def new(self, name, fpath, parent_logger, lvl=None, is_ignore=False, fmt=None):
 
         if fmt is None: fmt = MULTI_LOGGER_FORMAT
+        if lvl is None: lvl = self._log_lvl
 
         tlog = type(parent_logger)
         if not issubclass(tlog, BaseLogger):
@@ -193,7 +197,7 @@ class MultiLogger:
         if name in self._logs: parent_logger.critical("Logger with name '%s' has already been created!" % name)
 
         parent_logger.debug("Creating logger '%s' at path '%s'." % (name, fpath))
-        logger = FileLogger.getLogger(name, fpath, lvl=lvl, fmt=fmt)
+        logger = FileLogger.getLogger(name, fpath, lvl=lvl, fmt=fmt, is_ignore=is_ignore)
 
         self._logs[name] = logger
 
@@ -216,7 +220,7 @@ class MultiLogger:
 
         dpath = self._dpath
         n = len(os.listdir(dpath))
-        is_new = n == 0
+        is_new = n == 0 
 
         if is_new: 
             logger.info("Starting new run.")

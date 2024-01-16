@@ -1,2 +1,2 @@
 
-from directorybatching.model.funwave import FunwaveBatch
+from directorybatching.model.funwave import FunwaveJob, FunwaveBatch
